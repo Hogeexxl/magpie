@@ -79,6 +79,8 @@ type packedRow struct {
 const (
 	rowHandedOn        = 128
 	rowReasoningHidden = 512
+	rowCompactionKnown = 1024
+	rowCompaction      = 2048
 )
 
 // rowOwnCost marks a reported call that said what it cost (#1874): Cost is
@@ -87,18 +89,19 @@ const (
 const rowOwnCost = 256
 
 type rowChunk struct {
-	Archive         []byte
-	Locations       []*time.Location
-	Rows            []packedRow
-	Strings         []string
-	codexActors     []string
-	codexIdentities map[string]sessions.CodexIdentity
-	dict            map[string]uint32
-	Source          sessions.CallSource
-	Bytes           int64
-	Used            uint64
-	Count           int
-	Latest          time.Time
+	Archive          []byte
+	Locations        []*time.Location
+	Rows             []packedRow
+	Strings          []string
+	codexActors      []string
+	codexCompactions map[int]*bool
+	codexIdentities  map[string]sessions.CodexIdentity
+	dict             map[string]uint32
+	Source           sessions.CallSource
+	Bytes            int64
+	Used             uint64
+	Count            int
+	Latest           time.Time
 	// Computer is the other computer whose day this is (#542), by id
 	Computer string
 }
@@ -168,6 +171,12 @@ func (c *rowChunk) add(r Row, msg string, order int64, failed bool) {
 		p.Flags |= rowOwnCost
 		p.Cost = *r.OwnCost
 	}
+	if r.Compaction != nil {
+		p.Flags |= rowCompactionKnown
+		if *r.Compaction {
+			p.Flags |= rowCompaction
+		}
+	}
 	c.Rows = append(c.Rows, p)
 	if c.codexActors != nil || r.codexActor != "" {
 		if c.codexActors == nil {
@@ -188,6 +197,18 @@ func (c *rowChunk) add(r Row, msg string, order int64, failed bool) {
 func (c *rowChunk) row(i int) Row {
 	p := &c.Rows[i]
 	r := Row{Record: Record{RouteID: p.RouteID, Time: p.Time, Input: int(p.Tokens[0]), Output: int(p.Tokens[1]), CacheRead: int(p.Tokens[2]), CacheWrite: int(p.Tokens[3]), CacheWrite1h: int(p.Tokens[5]), Reasoning: int(p.Tokens[4]), Millis: p.Millis, TTFT: p.TTFT, FirstText: p.FirstText, FirstReasoning: p.FirstReasoning, ReasoningHidden: p.Flags&rowReasoningHidden != 0, Sent: p.Sent, Flow: p.Flow, Own: p.Own, Retried: p.Retried, Queued: p.Queued, Status: int(p.Status), Tries: int(p.Tries), HandedOn: p.Flags&rowHandedOn != 0, Rejected: p.Flags&4 != 0, SessionOfficialLogin: p.Flags&8 != 0}, Cost: p.Cost, Priced: p.Flags&1 != 0, Swapped: p.Flags&2 != 0, Routed: p.Flags&32 != 0}
+	if p.Flags&rowCompactionKnown != 0 {
+		compacted := p.Flags&rowCompaction != 0
+		r.Compaction = &compacted
+	}
+	if compacted, ok := c.codexCompactions[i]; ok {
+		if compacted == nil {
+			r.Compaction = nil
+		} else {
+			value := *compacted
+			r.Compaction = &value
+		}
+	}
 	for i, s := range rowText(&r) {
 		*s = c.Strings[p.Text[i]]
 	}
@@ -210,6 +231,18 @@ func (c *rowChunk) row(i int) Row {
 		r = codexIdentityRow(r, actor, c.codexIdentities)
 	}
 	return r
+}
+
+func (c *rowChunk) setCodexCompaction(index int, compacted *bool) {
+	if c.codexCompactions == nil {
+		c.codexCompactions = make(map[int]*bool)
+	}
+	if compacted == nil {
+		c.codexCompactions[index] = nil
+		return
+	}
+	value := *compacted
+	c.codexCompactions[index] = &value
 }
 
 type rowRef struct {
@@ -877,6 +910,7 @@ func buildRequestBlocksWithCodex(p Period, f Filter, offset, limit int, now time
 			actor = local.Chunk.codexActors[local.Index]
 		}
 		setCodexActor(gateway.Chunk, gateway.Index, actor)
+		gateway.Chunk.setCodexCompaction(gateway.Index, local.row().Compaction)
 	}
 	all := append(append(slices.Clone(gateways), chunks...), others...)
 	visit := func(fn func(rowRef, Row)) {

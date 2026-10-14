@@ -344,6 +344,8 @@ func logRecord(c sessions.Call) Record {
 		Millis: c.Millis, TTFT: c.TTFT, Session: c.Session, RequestID: c.RequestID, Error: c.ErrorText, ErrType: c.Error, Subagent: sessions.SubagentOf(c.File), ParentAgent: sessions.SubagentParent(c.File)}
 	if c.Agent == "codex" {
 		r.ResponseID = c.ResponseID
+		compacted := c.Compaction
+		r.Compaction = &compacted
 	}
 	if c.Agent == "codex" || c.Agent == "opencode" {
 		r.Requested, r.Served = c.Model, ""
@@ -359,11 +361,11 @@ func logRecord(c sessions.Call) Record {
 // and an end within 2s. Fallback matches must be unique in both logs: an
 // ambiguous direct call stays visible. One gateway entry consumes one file call.
 func gatewayMatches(recs []Record, logs []sessions.Call) map[int]bool {
-	matched, _, _ := gatewayMatchesDetails(recs, logs)
+	matched, _, _, _ := gatewayMatchesDetails(recs, logs)
 	return matched
 }
 
-func gatewayMatchesDetails(recs []Record, logs []sessions.Call) (map[int]bool, map[int]int, map[int]string) {
+func gatewayMatchesDetails(recs []Record, logs []sessions.Call) (map[int]bool, map[int]int, map[int]string, map[int]*bool) {
 	gateway, local := &rowChunk{}, &rowChunk{}
 	for i, r := range recs {
 		r.Agent = ReportedAs(r.Agent)
@@ -374,7 +376,7 @@ func gatewayMatchesDetails(recs []Record, logs []sessions.Call) (map[int]bool, m
 		r.Agent = c.Agent // the native log already names its agent
 		local.add(Row{Record: r, codexActor: codexActor(c)}, c.Msg, int64(i), c.Error != "")
 	}
-	duplicates, actors := duplicateCodexCalls(logs)
+	duplicates, actors, compactions := duplicateCodexCalls(logs)
 	pairs := codexResponseMatches(recs, logs, duplicates)
 	deduplicate := map[rowRef]bool{}
 	for index := range duplicates {
@@ -391,7 +393,7 @@ func gatewayMatchesDetails(recs []Record, logs []sessions.Call) (map[int]bool, m
 	for index := range duplicates {
 		matched[index] = true
 	}
-	return matched, pairs, actors
+	return matched, pairs, actors, compactions
 }
 
 func ledgerWith(since time.Time, f Filter, recs []Record, logs []sessions.Call) (rows []Row, sum Totals, agents, providers []string) {
@@ -402,13 +404,13 @@ func ledgerWith(since time.Time, f Filter, recs []Record, logs []sessions.Call) 
 // priced and judged here as this computer's are, and none from until on (a
 // picked range's end, #1492; zero for none).
 func ledgerWithShared(since, until time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall) (rows []Row, sum Totals, agents, providers []string) {
-	matched, pairs, actors := gatewayMatchesDetails(recs, logs)
-	return ledgerMatched(since, until, f, recs, logs, others, matched, pairs, actors)
+	matched, pairs, actors, compactions := gatewayMatchesDetails(recs, logs)
+	return ledgerMatched(since, until, f, recs, logs, others, matched, pairs, actors, compactions)
 }
 
 // ledgerMatched is ledgerWithShared with the session files' calls the
 // gateway saw already told (matched, by their index in logs).
-func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall, matched map[int]bool, pairs map[int]int, actors map[int]string) (rows []Row, sum Totals, agents, providers []string) {
+func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall, matched map[int]bool, pairs map[int]int, actors map[int]string, compactions map[int]*bool) (rows []Row, sum Totals, agents, providers []string) {
 	renamed := provider.Renamed()
 	// the upstream names in force now, read once for the lot: a row is
 	// judged by the names standing today, which is what Ledger says, and
@@ -457,6 +459,7 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 			if override, ok := actors[call]; ok {
 				actor = override
 			}
+			r.Compaction = compactions[call]
 		}
 		add(r, priceOf(r), r.Source, actor)
 	}
@@ -467,6 +470,9 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 		// Session identity does not establish a billing provider; price the
 		// record through the same lookup without inferring one from the account.
 		r := logRecord(c)
+		if metadata, ok := compactions[i]; ok {
+			r.Compaction = metadata
+		}
 		actor := codexActor(c)
 		if override, ok := actors[i]; ok {
 			actor = override

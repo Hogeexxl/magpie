@@ -660,6 +660,66 @@ func TestCallsCodexCompactTook(t *testing.T) {
 	check()
 }
 
+func TestCallsCodexLateCompactionMarkerPatchesZeroDuration(t *testing.T) {
+	u := cxUse(100, 40, 0, 10, 2)
+	lines := append(cxTurnLines(0, "t1", "gpt-6-astra", "high"), cxRecordLine(0, "resp-zero", u, u))
+	path := codexUsageLog(t, lines)
+	find := func(want bool) Call {
+		t.Helper()
+		for _, call := range Calls(time.Time{}) {
+			if call.ResponseID == "resp-zero" {
+				if call.Compaction != want {
+					t.Fatalf("compaction marker %v; want %v: %+v", call.Compaction, want, call)
+				}
+				return call
+			}
+		}
+		t.Fatalf("compaction response missing: %+v", Calls(time.Time{}))
+		return Call{}
+	}
+	if call := find(false); call.Compact != 0 || call.Millis != 0 {
+		t.Fatalf("initial call has unexpected timing: %+v", call)
+	}
+	appendText(t, path, cxCompactionLine(0, "resp-zero", u, u)+"\n")
+	if call := find(true); call.Compact != 0 || call.Millis != 0 {
+		t.Fatalf("late marker changed zero duration: %+v", call)
+	}
+	Reset()
+	if call := find(true); call.Compact != 0 || call.Millis != 0 {
+		t.Fatalf("cached marker lost zero duration: %+v", call)
+	}
+}
+
+func TestCallsCodexOldCacheWithoutCompactionMarkerIsIgnored(t *testing.T) {
+	u := cxUse(100, 40, 0, 10, 2)
+	lines := append(cxTurnLines(0, "t1", "gpt-6-astra", "high"), cxRecordLine(0, "resp-old-cache", u, u), cxCompactionLine(0, "resp-old-cache", u, u))
+	path := codexUsageLog(t, lines)
+	if calls := Calls(time.Time{}); len(calls) != 1 || !calls[0].Compaction {
+		t.Fatalf("native compaction: %+v", calls)
+	}
+	st := loadCalls(file{path: path, agent: "codex"})
+	if st == nil || len(st.Calls) != 1 {
+		t.Fatal("could not load the cached call")
+	}
+	st.Calls[0].Compaction = false // an older cache has no marker field
+	writeCalls(st, 0, false)
+	old := filepath.Join(filepath.Dir(CachePath()), "calls-v14", hashHead(path)+".gob")
+	if err := os.MkdirAll(filepath.Dir(old), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(callCachePath(path), old); err != nil {
+		t.Fatal(err)
+	}
+	Reset()
+	calls := Calls(time.Time{})
+	if len(calls) != 1 || !calls[0].Compaction {
+		t.Fatalf("old cache hid the native compaction marker: %+v", calls)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("old call cache still exists: %v", err)
+	}
+}
+
 // bare is a call without where it is in its file, which a test of what the
 // calls are has no want of.
 func bare(c Call) Call {

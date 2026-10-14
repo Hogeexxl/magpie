@@ -73,6 +73,34 @@ func sameCodexCall(a, b Row) bool {
 		a.Error == b.Error && a.ErrType == b.ErrType && a.RequestID == b.RequestID
 }
 
+func codexCompactionOf(call sessions.Call) *bool {
+	if call.Agent != "codex" {
+		return nil
+	}
+	compacted := call.Compaction
+	return &compacted
+}
+
+func mergeCodexCompactions(values []*bool) *bool {
+	allKnown, confirmed := len(values) > 0, false
+	for _, value := range values {
+		if value == nil {
+			allKnown = false
+			continue
+		}
+		confirmed = confirmed || *value
+	}
+	if confirmed {
+		yes := true
+		return &yes
+	}
+	if allKnown {
+		no := false
+		return &no
+	}
+	return nil
+}
+
 func isCodexRow(row Row) bool {
 	if row.Client != "" {
 		return row.Client == "codex"
@@ -80,14 +108,19 @@ func isCodexRow(row Row) bool {
 	return row.Agent == "codex"
 }
 
-func duplicateCodexCalls(calls []sessions.Call) (map[int]bool, map[int]string) {
+func duplicateCodexCalls(calls []sessions.Call) (map[int]bool, map[int]string, map[int]*bool) {
 	local := map[string][]int{}
 	for i, call := range calls {
 		if call.Agent == "codex" && call.ResponseID != "" {
 			local[call.ResponseID] = append(local[call.ResponseID], i)
 		}
 	}
-	skip, actors := map[int]bool{}, map[int]string{}
+	skip, actors, compactions := map[int]bool{}, map[int]string{}, map[int]*bool{}
+	for index, call := range calls {
+		if call.Agent == "codex" {
+			compactions[index] = codexCompactionOf(call)
+		}
+	}
 	for _, indexes := range local {
 		if len(indexes) < 2 {
 			continue
@@ -114,13 +147,18 @@ func duplicateCodexCalls(calls []sessions.Call) (map[int]bool, map[int]string) {
 		for _, index := range indexes[1:] {
 			skip[index] = true
 		}
+		merged := make([]*bool, len(indexes))
+		for i, index := range indexes {
+			merged[i] = codexCompactionOf(calls[index])
+		}
+		compactions[indexes[0]] = mergeCodexCompactions(merged)
 		if actorConflict {
 			actors[indexes[0]] = ""
 		} else {
 			actors[indexes[0]] = actor
 		}
 	}
-	return skip, actors
+	return skip, actors, compactions
 }
 
 func cloneCodexChunks(chunks []*rowChunk) []*rowChunk {
@@ -128,6 +166,7 @@ func cloneCodexChunks(chunks []*rowChunk) []*rowChunk {
 	for i, chunk := range chunks {
 		copy := *chunk
 		copy.codexActors = slices.Clone(chunk.codexActors)
+		copy.codexCompactions = nil
 		copy.codexIdentities = nil
 		out[i] = &copy
 	}
@@ -220,6 +259,11 @@ func foldCodexRows(locals []*rowChunk) map[rowRef]bool {
 		for _, ref := range refs[1:] {
 			skip[ref] = true
 		}
+		compactions := make([]*bool, len(refs))
+		for i := range refs {
+			compactions[i] = rows[i].Compaction
+		}
+		refs[0].Chunk.setCodexCompaction(refs[0].Index, mergeCodexCompactions(compactions))
 	}
 	return skip
 }

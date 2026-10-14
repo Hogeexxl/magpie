@@ -34,6 +34,7 @@ type Summary struct {
 	ID            string        `json:"id"`
 	Cwd           string        `json:"cwd"`
 	Title         string        `json:"title"`
+	Nickname      string        `json:"nickname,omitempty"`
 	Last          time.Time     `json:"last"`
 	Role          string        `json:"role,omitempty"`
 	ParentSession string        `json:"parent_session,omitempty"`
@@ -124,6 +125,7 @@ func statsAt(days int, now time.Time) Stats {
 	// finds them read rather than starting another run
 	refresh(files, files)
 	identities := codexIdentitySnapshot(files)
+	taskTitles := codexSubagentTaskTitles(files)
 	var want []file
 	for _, f := range files {
 		if !f.mod.Before(since) {
@@ -309,8 +311,10 @@ func statsAt(days int, now time.Time) Stats {
 			continue
 		}
 		setSessionCodexIdentity(&s, identities)
+		setSessionCodexTaskTitle(&s, taskTitles)
 		sum := Summary{Key: key, Agent: s.Agent, ID: s.ID, Cwd: cmp.Or(folder[key], s.Cwd), Title: clip(s.Title, 160),
-			Last: s.Last, Role: s.Role, ParentSession: s.ParentSession, RootSession: s.RootSession, Priced: true, Active: sh.active / 1000, Models: []string{}, Days: []int{},
+			Nickname: s.Nickname,
+			Last:     s.Last, Role: s.Role, ParentSession: s.ParentSession, RootSession: s.RootSession, Priced: true, Active: sh.active / 1000, Models: []string{}, Days: []int{},
 			Prompts: sh.prompts, Replies: sh.replies, tools: sh.tools, skills: sh.skills, skillLast: sh.skillLast,
 			perDay: map[int]*summaryDay{}}
 		for _, n := range sh.tools {

@@ -95,6 +95,9 @@ type Record struct {
 	// none for a reply that wasn't streamed (#196)
 	TTFT      int64 `json:"ttft_ms,omitempty"`
 	FirstText int64 `json:"first_text_ms,omitempty"`
+	// Compaction is Codex's explicit native marker. Nil means no matching
+	// native Codex call established whether a gateway row compacted.
+	Compaction *bool `json:"compaction,omitempty"`
 	// FirstReasoning is the start of paced visible reasoning, absent for hidden reasoning.
 	FirstReasoning  int64 `json:"first_reasoning_ms,omitempty"`
 	ReasoningHidden bool  `json:"reasoning_hidden,omitempty"`
