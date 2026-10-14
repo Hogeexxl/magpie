@@ -358,6 +358,16 @@ metadata, gateway-only entries and conflicting identities set `role` to
 `unknown` and do not acquire a guessed parent or root. These fields are omitted
 for other agents. This is Codex-specific (#1591).
 
+Codex keeps the existing session-title precedence. Only when that leaves the
+title empty may a child thread use its parent's `spawn_agent` `task_name`,
+matched by the same `call_id` and an `item_completed` event whose item has type
+`SubAgentActivity`, kind `started`, the same `id`, and the child's
+`agent_thread_id`.
+The native top-level `session_meta.agent_nickname` is exposed separately as
+`nickname` on list, one, manage and overview responses; it does not replace the
+title. The parsed-session cache is versioned for nickname and task-title
+metadata, and the Codex-call cache for compaction, so older parses are rebuilt.
+
 `GET /api/sessions`, `/api/sessions/one` and `/api/sessions/manage` also return
 `model_effort` for each Codex thread, grouped by the canonical Usage ledger's
 `model` and effective reasoning effort. It carries that thread's input, output,
@@ -383,3 +393,12 @@ parent thread ID. `native_session` stays the recorded native header. The new
 `session_role` is omitted for other agents, whose existing field semantics stay
 unchanged. Ambiguous or unpaired calls do not inherit a relationship from shared
 session metadata.
+
+`GET /api/usage/requests` and `GET /v1/magpie/usage/requests` expose Codex
+`compaction` as `true` or `false` when a native Codex call establishes the
+marker state, and omit it when there is no matching native evidence. A unique
+`response_id` match adds this metadata to the gateway row while preserving that
+row's model, usage, cost and kind.
+Compaction is already included in Codex's total consumption, so this marker
+does not add tokens or cost. This is Codex-only; Claude behavior and the POST
+`/v1/magpie/usage/requests` ingest allowlist are unchanged.

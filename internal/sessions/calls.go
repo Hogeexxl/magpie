@@ -42,6 +42,8 @@ type Call struct {
 	ErrorText string `json:"error_text,omitempty"` // its message, the first 400 characters
 	// Codex: the turn's own figures, set only when the turn made just this call
 	TTFT int64 `json:"ttft_ms,omitempty"`
+	// Compaction is Codex's explicit marker that this response compacted the context.
+	Compaction bool `json:"compaction,omitempty"`
 	// Millis: how long the call took. Codex's, of a turn that made this call alone, is what
 	// it says; the rest are told from the file's times, the call's last line less the line
 	// that asked for it (a prompt, a tool's result), and so a little more or less than it was
@@ -844,7 +846,7 @@ func (st *callFile) codexChanged(change *codexChange) {
 		threadID = r.ThreadID
 	}
 	c := Call{Time: v.At, Agent: "codex", Session: r.Session, ThreadID: threadID, Model: v.Model, Tokens: spent(v.Usage.raw()), ResponseID: v.ResponseID,
-		Upstream: context.Upstream, AccountID: r.AccountID, UserID: r.UserID, Reasoning: v.Usage.Reasoning, Effort: context.Effort, Cwd: context.Cwd, File: st.Path, From: r.LastEnd, To: st.End}
+		Upstream: context.Upstream, AccountID: r.AccountID, UserID: r.UserID, Reasoning: v.Usage.Reasoning, Effort: context.Effort, Compaction: v.Compaction, Cwd: context.Cwd, File: st.Path, From: r.LastEnd, To: st.End}
 	if c.Session == "" {
 		c.Session = r.Session
 	}

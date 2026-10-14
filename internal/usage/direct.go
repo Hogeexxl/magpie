@@ -46,6 +46,7 @@ func directRows(p Period, now time.Time) []Row {
 	logs, others := reader(since), sharedRecords(since)
 	matched := map[int]bool{}
 	actors := map[int]string{}
+	_, _, compactions := duplicateCodexCalls(logs)
 	if len(logs) > 0 {
 		local := &rowChunk{}
 		for i, c := range logs {
@@ -76,7 +77,7 @@ func directRows(p Period, now time.Time) []Row {
 			}
 		}
 	}
-	rows, _, _, _ := ledgerMatched(since, until, Filter{}, nil, logs, others, matched, nil, actors)
+	rows, _, _, _ := ledgerMatched(since, until, Filter{}, nil, logs, others, matched, nil, actors, compactions)
 	return rows
 }
 

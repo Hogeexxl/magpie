@@ -37,10 +37,11 @@ import (
 // (Compact): Claude Code's compact_boundary durationMs, Codex's compaction
 // call's own time.
 // v14: Codex calls keep the thread that made the request.
+// v15: Codex calls keep the compaction marker independently of its duration.
 // What each version names is what a cache of the one before it cannot serve:
 // the version is part of the directory's name, so a cache written by an older
 // one is never read (pruneCalls).
-const callCacheVersion = "calls-v14"
+const callCacheVersion = "calls-v15"
 const maxKeptCalls = 131072
 const maxKeptFiles = 64
 

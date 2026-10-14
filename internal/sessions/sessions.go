@@ -119,6 +119,7 @@ type Session struct {
 	ID            string        `json:"id"`
 	Cwd           string        `json:"cwd"`
 	Title         string        `json:"title"` // the name it was given, else the agent's own title, else the first prompt
+	Nickname      string        `json:"nickname,omitempty"`
 	Start         time.Time     `json:"start"`
 	Last          time.Time     `json:"last"`
 	Role          string        `json:"role,omitempty"`
@@ -173,6 +174,11 @@ type state struct {
 	ID                    string            `json:"id,omitempty"`
 	CodexIdentity         *CodexIdentity    `json:"codex_identity,omitempty"`
 	CodexIdentityConflict bool              `json:"codex_identity_conflict,omitempty"`
+	CodexNickname         string            `json:"codex_nickname,omitempty"`
+	CodexSpawnNames       map[string]string `json:"codex_spawn_names,omitempty"`
+	CodexSpawnConflicts   map[string]bool   `json:"codex_spawn_conflicts,omitempty"`
+	CodexAgentIDs         map[string]string `json:"codex_agent_ids,omitempty"`
+	CodexAgentConflicts   map[string]bool   `json:"codex_agent_conflicts,omitempty"`
 	Cwd                   string            `json:"cwd,omitempty"`
 	Title                 string            `json:"title,omitempty"`
 	Named                 string            `json:"named,omitempty"`  // the agent's own title for it
@@ -335,6 +341,10 @@ func (s *state) clone() *state {
 		t := *s.Total
 		c.Total = &t
 	}
+	c.CodexSpawnNames = maps.Clone(s.CodexSpawnNames)
+	c.CodexSpawnConflicts = maps.Clone(s.CodexSpawnConflicts)
+	c.CodexAgentIDs = maps.Clone(s.CodexAgentIDs)
+	c.CodexAgentConflicts = maps.Clone(s.CodexAgentConflicts)
 	c.Days = make(map[string]*day, len(s.Days))
 	for k, v := range s.Days {
 		d := &day{Active: v.Active, Models: make(map[string]Tokens, len(v.Models)), Prompts: v.Prompts, Replies: v.Replies}
@@ -580,7 +590,8 @@ func CachePath() string { return filepath.Join(filepath.Dir(catalog.CachePath())
 // 18: Claude Code's 1-hour cache writes apart from its 5-minute ones.
 // 19: the names the user gave Claude Code's and WorkBuddy's (custom-title).
 // 20: Codex's source and direct parent thread identity.
-const cacheVersion = 20
+// 21: Codex subagent nicknames and parent spawn task names.
+const cacheVersion = 21
 
 type cacheFile struct {
 	Version int               `json:"version"`
@@ -976,12 +987,14 @@ func List(limit int) []Session {
 	// after it has nothing left to do
 	refresh(files, files)
 	identities := codexIdentitySnapshot(files)
+	taskTitles := codexSubagentTaskTitles(files)
 
 	price := pricer()
 	out := []Session{}
 	for _, k := range keys {
 		if s, ok := assemble(groups[k], price); ok {
 			setSessionCodexIdentity(&s, identities)
+			setSessionCodexTaskTitle(&s, taskTitles)
 			out = append(out, s)
 			if len(out) == limit {
 				break
@@ -1032,6 +1045,9 @@ func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
 			if (s.Agent == "codex" || s.Agent == "pi" || s.Agent == "omp" || s.Agent == "dsh" || s.Agent == "grok" || s.Agent == "droid") && st.ID != "" && f.path == fs[0].path {
 				s.ID = st.ID
 			}
+		}
+		if s.Agent == "codex" && st.CodexNickname != "" {
+			s.Nickname = st.CodexNickname
 		}
 		if !st.Start.IsZero() && (s.Start.IsZero() || st.Start.Before(s.Start)) {
 			s.Start = st.Start
@@ -1520,9 +1536,21 @@ func Titles(keys []string) map[string]string {
 		return out
 	}
 	refresh(fs, files)
+	parents := codexTaskParentFiles(fs, files)
+	if len(parents) > 0 {
+		refresh(parents, files)
+	}
+	titleFiles := append(append([]file(nil), fs...), parents...)
+	taskTitles := codexSubagentTaskTitles(titleFiles)
+	identities := codexIdentitySnapshot(fs)
 	price := pricer()
 	for k, g := range groups {
-		if s, ok := assemble(g, price); ok && s.Title != "" {
+		if s, ok := assemble(g, price); ok {
+			setSessionCodexIdentity(&s, identities)
+			setSessionCodexTaskTitle(&s, taskTitles)
+			if s.Title == "" {
+				continue
+			}
 			out[k] = s.Title
 		}
 	}
@@ -1547,6 +1575,7 @@ func Get(key string) (Session, bool) {
 		return Session{}, false
 	}
 	var identities map[string]CodexIdentity
+	var taskTitles map[string]codexTaskTitle
 	if strings.HasPrefix(key, "codex:") {
 		var codexFiles []file
 		for _, f := range files {
@@ -1556,10 +1585,12 @@ func Get(key string) (Session, bool) {
 		}
 		refresh(codexFiles, files)
 		identities = codexIdentitySnapshot(codexFiles)
+		taskTitles = codexSubagentTaskTitles(codexFiles)
 	} else {
 		refresh(fs, files)
 	}
 	s, ok := assemble(fs, pricer())
 	setSessionCodexIdentity(&s, identities)
+	setSessionCodexTaskTitle(&s, taskTitles)
 	return s, ok
 }
