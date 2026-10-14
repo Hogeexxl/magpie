@@ -20,15 +20,18 @@ type cxLine struct {
 	Payload struct {
 		cxCompaction
 		cxHistorySnapshot
-		Type        string   `json:"type"`
-		SessionID   string   `json:"session_id"`
-		TurnID      string   `json:"turn_id"`
-		ResponseID  string   `json:"response_id"`
-		Usage       *cxUsage `json:"usage"`
-		ThreadUsage *cxUsage `json:"thread_token_usage"`
-		ID          string   `json:"id"`
-		Cwd         string   `json:"cwd"`
-		Model       string   `json:"model"`
+		Type           string          `json:"type"`
+		SessionID      string          `json:"session_id"`
+		ThreadID       string          `json:"thread_id"`
+		ParentThreadID string          `json:"parent_thread_id"`
+		Source         json.RawMessage `json:"source"`
+		TurnID         string          `json:"turn_id"`
+		ResponseID     string          `json:"response_id"`
+		Usage          *cxUsage        `json:"usage"`
+		ThreadUsage    *cxUsage        `json:"thread_token_usage"`
+		ID             string          `json:"id"`
+		Cwd            string          `json:"cwd"`
+		Model          string          `json:"model"`
 		// session_meta's
 		ModelProvider string `json:"model_provider"`
 		Role          string `json:"role"`
@@ -156,6 +159,206 @@ var cxCalls = map[string]bool{"function_call": true, "custom_tool_call": true, "
 
 var cxName = []byte(`"name":"`)
 
+const (
+	codexRoleMain     = "main"
+	codexRoleSubagent = "subagent"
+	codexRoleUnknown  = "unknown"
+)
+
+func codexIdentityFromMeta(id string, source json.RawMessage, topParent string) (CodexIdentity, bool) {
+	identity := CodexIdentity{ID: id, Role: codexRoleUnknown}
+	role, sourceParent := codexSource(source)
+	if sourceParent != "" && topParent != "" && sourceParent != topParent || role == codexRoleMain && topParent != "" {
+		return identity, true
+	}
+	if sourceParent == "" {
+		sourceParent = topParent
+	}
+	if role == codexRoleUnknown && sourceParent != "" {
+		role = codexRoleSubagent
+	}
+	identity.Role, identity.ParentSession = role, sourceParent
+	return identity, false
+}
+
+func codexSource(source json.RawMessage) (string, string) {
+	var name string
+	if json.Unmarshal(source, &name) == nil {
+		switch name {
+		case "cli", "vscode", "exec", "mcp":
+			return codexRoleMain, ""
+		default:
+			return codexRoleUnknown, ""
+		}
+	}
+	var variants map[string]json.RawMessage
+	if json.Unmarshal(source, &variants) != nil || len(variants) != 1 {
+		return codexRoleUnknown, ""
+	}
+	if raw, ok := variants["custom"]; ok {
+		var custom string
+		if json.Unmarshal(raw, &custom) == nil && custom != "" {
+			return codexRoleMain, ""
+		}
+		return codexRoleUnknown, ""
+	}
+	raw, ok := variants["subagent"]
+	if !ok {
+		return codexRoleUnknown, ""
+	}
+	var kind map[string]json.RawMessage
+	if json.Unmarshal(raw, &kind) != nil || len(kind) != 1 {
+		return codexRoleSubagent, ""
+	}
+	raw, ok = kind["thread_spawn"]
+	if !ok {
+		return codexRoleSubagent, ""
+	}
+	var thread struct {
+		Parent string `json:"parent_thread_id"`
+	}
+	if json.Unmarshal(raw, &thread) != nil {
+		return codexRoleSubagent, ""
+	}
+	return codexRoleSubagent, thread.Parent
+}
+
+func mergeCodexIdentity(old, next CodexIdentity) (CodexIdentity, bool) {
+	if old.ID != next.ID || old.Role != codexRoleUnknown && next.Role != codexRoleUnknown && old.Role != next.Role ||
+		old.ParentSession != "" && next.ParentSession != "" && old.ParentSession != next.ParentSession {
+		return CodexIdentity{ID: old.ID, Role: codexRoleUnknown}, true
+	}
+	if old.Role == codexRoleUnknown {
+		old.Role = next.Role
+	}
+	if old.ParentSession == "" {
+		old.ParentSession = next.ParentSession
+	}
+	return old, false
+}
+
+func noteCodexIdentity(s *state, identity CodexIdentity, conflict bool) {
+	if s.CodexIdentity == nil {
+		copy := identity
+		s.CodexIdentity, s.CodexIdentityConflict = &copy, conflict
+		return
+	}
+	if s.CodexIdentityConflict {
+		return
+	}
+	old := *s.CodexIdentity
+	merged, conflictFound := mergeCodexIdentity(old, identity)
+	if conflict || conflictFound {
+		s.CodexIdentity = &CodexIdentity{ID: old.ID, Role: codexRoleUnknown}
+		s.CodexIdentityConflict = true
+		return
+	}
+	s.CodexIdentity = &merged
+}
+
+// CodexIdentities returns an independent snapshot of the native thread identities.
+func CodexIdentities() map[string]CodexIdentity {
+	dbReadMu.Lock()
+	defer dbReadMu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
+	loadCache()
+	defer closeDBs()
+	want := append(codexFiles(), wslFiles("codex")...)
+	refresh(want, nil)
+	return codexIdentitySnapshot(want)
+}
+
+func setSessionCodexIdentity(s *Session, identities map[string]CodexIdentity) {
+	if s.Agent != "codex" {
+		return
+	}
+	if identity, ok := identities[s.ID]; ok {
+		s.Role, s.ParentSession, s.RootSession = identity.Role, identity.ParentSession, identity.RootSession
+	}
+}
+
+func codexIdentitySnapshot(files []file) map[string]CodexIdentity {
+	identities := map[string]CodexIdentity{}
+	conflicts := map[string]bool{}
+	for _, f := range files {
+		if f.agent != "codex" {
+			continue
+		}
+		id := strings.TrimPrefix(f.key, "codex:")
+		identity := CodexIdentity{ID: id, Role: codexRoleUnknown}
+		conflict := false
+		if s := cache[f.path]; s != nil && s.CodexIdentity != nil {
+			identity = *s.CodexIdentity
+			conflict = s.CodexIdentityConflict
+			if identity.ID == "" {
+				identity.ID = id
+			}
+			if identity.Role == "" {
+				identity.Role = codexRoleUnknown
+			}
+		}
+		if identity.ID == "" {
+			continue
+		}
+		if conflict {
+			conflicts[identity.ID] = true
+		}
+		old, ok := identities[identity.ID]
+		if !ok {
+			identities[identity.ID] = identity
+			continue
+		}
+		merged, conflict := mergeCodexIdentity(old, identity)
+		if conflict {
+			conflicts[identity.ID] = true
+		} else {
+			identities[identity.ID] = merged
+		}
+	}
+	for id := range conflicts {
+		identities[id] = CodexIdentity{ID: id, Role: codexRoleUnknown}
+	}
+	for id, identity := range identities {
+		if identity.Role == codexRoleMain {
+			identity.RootSession = id
+			identities[id] = identity
+		}
+	}
+	for id, identity := range identities {
+		if identity.Role != codexRoleSubagent {
+			continue
+		}
+		identity.RootSession = codexRoot(identity, identities)
+		identities[id] = identity
+	}
+	return identities
+}
+
+func codexRoot(identity CodexIdentity, identities map[string]CodexIdentity) string {
+	seen := map[string]bool{identity.ID: true}
+	parent := identity.ParentSession
+	for parent != "" {
+		if seen[parent] {
+			return ""
+		}
+		seen[parent] = true
+		ancestor, ok := identities[parent]
+		if !ok {
+			return ""
+		}
+		switch ancestor.Role {
+		case codexRoleMain:
+			return ancestor.ID
+		case codexRoleSubagent:
+			parent = ancestor.ParentSession
+		default:
+			return ""
+		}
+	}
+	return ""
+}
+
 // typeAfter is the word in quotes after the first key in b, or "".
 func typeAfter(b, key []byte) string {
 	i := bytes.Index(b, key)
@@ -211,9 +414,13 @@ func codexBody(s *state, b []byte, main bool) {
 		codexApply(s, codexState(s).compacted(at, s.Model, p.cxCompaction))
 	case l.Type == "token_usage_record":
 		if p.Usage != nil {
-			codexApply(s, codexState(s).record(codexContribution{ResponseID: p.ResponseID, Session: p.SessionID, Turn: p.TurnID, Model: s.Model, At: at, Usage: *p.Usage, Total: p.ThreadUsage}))
+			codexApply(s, codexState(s).record(codexContribution{ResponseID: p.ResponseID, Session: p.SessionID, ThreadID: p.ThreadID, Turn: p.TurnID, Model: s.Model, At: at, Usage: *p.Usage, Total: p.ThreadUsage}))
 		}
 	case l.Type == "session_meta":
+		identity, conflict := codexIdentityFromMeta(p.ID, p.Source, p.ParentThreadID)
+		if identity.ID != "" {
+			noteCodexIdentity(s, identity, conflict)
+		}
 		session := p.SessionID
 		if session == "" {
 			session = p.ID

@@ -22,6 +22,11 @@ import (
 // Row is one call as the ledger lists it.
 type Row struct {
 	Record
+	// SessionRole is the query-time Codex actor classification. Unknown is
+	// explicit so a shared session header cannot make an unpaired call look
+	// like its root thread.
+	SessionRole string `json:"session_role,omitempty"`
+	codexActor  string
 	// Cost is the call's effective price in USD, when its model's is known
 	// (Priced); Swapped: the reply named another model than Model
 	Cost    float64 `json:"cost"`
@@ -115,7 +120,7 @@ func (f Filter) keepsRow(r Row) bool {
 	if f.Through != "" && SourceOf(r) != f.Through {
 		return false
 	}
-	return f.keeps(r.Record)
+	return f.keepsRecord(r.Record, r.SessionRole != "", r.Subagent, r.ParentAgent)
 }
 
 // OtherComputers is the Filter.Computer of every other computer's calls.
@@ -135,6 +140,10 @@ func (f Filter) computer(r Record) bool {
 }
 
 func (f Filter) keeps(r Record) bool {
+	return f.keepsRecord(r, false, "", "")
+}
+
+func (f Filter) keepsRecord(r Record, codexIdentity bool, subagent, parentAgent string) bool {
 	if f.Day != "" {
 		var day [len(time.DateOnly)]byte
 		if string(r.Time.In(time.Local).AppendFormat(day[:0], time.DateOnly)) != f.Day {
@@ -172,6 +181,9 @@ func (f Filter) keeps(r Record) bool {
 		return false
 	}
 	if q := strings.ToLower(strings.TrimSpace(f.Query)); q != "" {
+		if codexIdentity && (strings.Contains(strings.ToLower(subagent), q) || strings.Contains(strings.ToLower(parentAgent), q)) {
+			return true
+		}
 		return slices.ContainsFunc([]string{r.Requested, r.Model, r.Served, r.Upstream, r.Provider, r.Host, r.Session, r.Effort, r.SessionProvider, r.SessionAccount, r.ProviderKeyID, r.ProviderKeyName, r.Account(), r.CallerKeyID, r.CallerKeyName}, func(s string) bool {
 			return strings.Contains(strings.ToLower(s), q)
 		})
@@ -330,6 +342,9 @@ func logRecord(c sessions.Call) Record {
 	r := Record{Time: c.Time, Agent: c.Agent, Provider: UnknownProvider, Model: c.Model, Served: c.Model, Requested: c.Requested,
 		Input: c.Input, Output: c.Output, CacheRead: c.CacheRead, CacheWrite: c.CacheWrite, CacheWrite1h: c.CacheWrite1h, Reasoning: c.Reasoning, Effort: c.Effort,
 		Millis: c.Millis, TTFT: c.TTFT, Session: c.Session, RequestID: c.RequestID, Error: c.ErrorText, ErrType: c.Error, Subagent: sessions.SubagentOf(c.File), ParentAgent: sessions.SubagentParent(c.File)}
+	if c.Agent == "codex" {
+		r.ResponseID = c.ResponseID
+	}
 	if c.Agent == "codex" || c.Agent == "opencode" {
 		r.Requested, r.Served = c.Model, ""
 	}
@@ -344,6 +359,11 @@ func logRecord(c sessions.Call) Record {
 // and an end within 2s. Fallback matches must be unique in both logs: an
 // ambiguous direct call stays visible. One gateway entry consumes one file call.
 func gatewayMatches(recs []Record, logs []sessions.Call) map[int]bool {
+	matched, _, _ := gatewayMatchesDetails(recs, logs)
+	return matched
+}
+
+func gatewayMatchesDetails(recs []Record, logs []sessions.Call) (map[int]bool, map[int]int, map[int]string) {
 	gateway, local := &rowChunk{}, &rowChunk{}
 	for i, r := range recs {
 		r.Agent = ReportedAs(r.Agent)
@@ -352,13 +372,26 @@ func gatewayMatches(recs []Record, logs []sessions.Call) map[int]bool {
 	for i, c := range logs {
 		r := logRecord(c)
 		r.Agent = c.Agent // the native log already names its agent
-		local.add(Row{Record: r}, c.Msg, int64(i), c.Error != "")
+		local.add(Row{Record: r, codexActor: codexActor(c)}, c.Msg, int64(i), c.Error != "")
+	}
+	duplicates, actors := duplicateCodexCalls(logs)
+	pairs := codexResponseMatches(recs, logs, duplicates)
+	deduplicate := map[rowRef]bool{}
+	for index := range duplicates {
+		deduplicate[rowRef{local, index}] = true
+	}
+	responsePairs := make(map[rowRef]rowRef, len(pairs))
+	for record, call := range pairs {
+		responsePairs[rowRef{gateway, record}] = rowRef{local, call}
 	}
 	matched := map[int]bool{}
-	for ref := range matchedBlocks([]*rowChunk{gateway}, []*rowChunk{local}, nil, time.Time{}, false) {
+	for ref := range matchedBlocks([]*rowChunk{gateway}, []*rowChunk{local}, deduplicate, responsePairs, time.Time{}, false) {
 		matched[ref.Index] = true
 	}
-	return matched
+	for index := range duplicates {
+		matched[index] = true
+	}
+	return matched, pairs, actors
 }
 
 func ledgerWith(since time.Time, f Filter, recs []Record, logs []sessions.Call) (rows []Row, sum Totals, agents, providers []string) {
@@ -369,36 +402,38 @@ func ledgerWith(since time.Time, f Filter, recs []Record, logs []sessions.Call) 
 // priced and judged here as this computer's are, and none from until on (a
 // picked range's end, #1492; zero for none).
 func ledgerWithShared(since, until time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall) (rows []Row, sum Totals, agents, providers []string) {
-	return ledgerMatched(since, until, f, recs, logs, others, gatewayMatches(recs, logs))
+	matched, pairs, actors := gatewayMatchesDetails(recs, logs)
+	return ledgerMatched(since, until, f, recs, logs, others, matched, pairs, actors)
 }
 
 // ledgerMatched is ledgerWithShared with the session files' calls the
 // gateway saw already told (matched, by their index in logs).
-func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall, matched map[int]bool) (rows []Row, sum Totals, agents, providers []string) {
+func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall, matched map[int]bool, pairs map[int]int, actors map[int]string) (rows []Row, sum Totals, agents, providers []string) {
 	renamed := provider.Renamed()
 	// the upstream names in force now, read once for the lot: a row is
 	// judged by the names standing today, which is what Ledger says, and
 	// the rows here are what a reader compares a bill against
 	wires := settings.Load().ModelWires
 	priceOf := pricer()
+	codexIdentities := sessions.CodexIdentities()
 	rows = make([]Row, 0, len(recs)+len(logs))
 	agents, providers = []string{}, []string{}
 	identities := newSessionResolver(logs)
-	add := func(r Record, pr *catalog.Price, source string) {
+	add := func(r Record, pr *catalog.Price, source, actor string) {
 		if a := ReportedAs(r.Agent); !slices.Contains(agents, a) {
 			agents = append(agents, a)
 		}
 		if r.Provider != "" && !slices.Contains(providers, r.Provider) {
 			providers = append(providers, r.Provider)
 		}
-		if !f.keepsRow(Row{Record: r, Source: source}) {
-			return
-		}
 		sent := r.Model
 		if source == "" {
 			sent = provider.SentNameIn(wires, r.Provider, r.Model, r.Effort)
 		}
-		row := Row{Record: r, Swapped: r.Served != "" && Swapped(sent, r.Served), Routed: GroupRouted(sent, r.Served), Source: source}
+		row := codexIdentityRow(Row{Record: r, Swapped: r.Served != "" && Swapped(sent, r.Served), Routed: GroupRouted(sent, r.Served), Source: source}, actor, codexIdentities)
+		if !f.keepsRow(row) {
+			return
+		}
 		if pr != nil && r.Input+r.Output > 0 {
 			row.Cost, row.Priced = r.CostAt(*pr), true
 		}
@@ -416,7 +451,14 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 		if id, ok := renamed[r.Provider]; ok {
 			r.Provider = id
 		}
-		add(r, priceOf(r), r.Source)
+		actor := ""
+		if call, ok := pairs[i]; ok && call >= 0 && call < len(logs) {
+			actor = logs[call].ThreadID
+			if override, ok := actors[call]; ok {
+				actor = override
+			}
+		}
+		add(r, priceOf(r), r.Source, actor)
 	}
 	for i, c := range logs {
 		if (!since.IsZero() && c.Time.Before(since)) || after(until, c.Time) || matched[i] {
@@ -425,10 +467,14 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 		// Session identity does not establish a billing provider; price the
 		// record through the same lookup without inferring one from the account.
 		r := logRecord(c)
+		actor := codexActor(c)
+		if override, ok := actors[i]; ok {
+			actor = override
+		}
 		r.SessionAccount = identities.resolve(c)
 		r.SessionOfficialLogin = identities.officialLogin(c, r.SessionAccount)
 		r.SessionProvider = c.Upstream
-		add(r, priceOf(r), "log")
+		add(r, priceOf(r), "log", actor)
 	}
 	for _, c := range others {
 		r := c.Record
@@ -438,7 +484,7 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 		if id, ok := renamed[r.Provider]; ok {
 			r.Provider = id
 		}
-		add(r, priceOf(r), c.Source)
+		add(r, priceOf(r), c.Source, "")
 	}
 	// the two logs, by when each call began
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Time.After(rows[j].Time) })

@@ -179,6 +179,13 @@ func sessionManageRoutes(mux *http.ServeMux, w Windows) {
 		}
 		if out.Agent != "" {
 			list := sessions.ListAgent(out.Agent)
+			var modelEffort map[string][]sessions.ModelEffort
+			if out.Agent == "codex" {
+				modelEffort = usage.CodexModelEffort(usage.All)
+			}
+			for i := range list {
+				addCodexModelEffort(&list[i].Session, modelEffort)
+			}
 			native := map[string]bool{}
 			for _, s := range list {
 				native[s.ID] = true
@@ -205,6 +212,7 @@ func sessionManageRoutes(mux *http.ServeMux, w Windows) {
 					continue
 				}
 				s := gatewaySession(g)
+				addCodexModelEffort(&s, modelEffort)
 				// its size is the conversation text magpie recorded of it
 				m := sessions.Managed{Session: s, Deletable: true, Size: sizes(s.Agent, s.ID)}
 				out.Sessions = append(out.Sessions, managedJSON{Managed: m, Via: vias[s.Agent+"|"+s.ID]})

@@ -93,15 +93,16 @@ type cxCompaction struct {
 }
 
 type codexContribution struct {
-	ResponseID, Session, Turn, Model string
-	Epoch                            int
-	At, Updated                      time.Time
-	Usage                            cxUsage
-	Total                            *cxUsage
-	CountTotal                       *cxUsage
-	CountEpoch                       int
-	ExpectedCount                    *cxUsage
-	Compaction                       bool
+	ResponseID, Session, ThreadID, Turn, Model string
+	ThreadIDConflict                           bool
+	Epoch                                      int
+	At, Updated                                time.Time
+	Usage                                      cxUsage
+	Total                                      *cxUsage
+	CountTotal                                 *cxUsage
+	CountEpoch                                 int
+	ExpectedCount                              *cxUsage
+	Compaction                                 bool
 }
 
 type codexChange struct {
@@ -134,10 +135,11 @@ func (s *codexUsageState) compacted(at time.Time, model string, p cxCompaction) 
 		}
 		v := old
 		v.Compaction = true
+		v.ThreadID, v.ThreadIDConflict = mergeCodexThreadID(old, codexContribution{ThreadID: r.ThreadID})
 		s.Entries[i] = v
 		change = &codexChange{Index: i, Old: &old, Value: v}
 	} else {
-		change = s.record(codexContribution{ResponseID: r.ResponseID, Session: session, Turn: r.TurnID, Model: model, At: at, Usage: *r.Usage, Total: r.ThreadUsage, Compaction: true})
+		change = s.record(codexContribution{ResponseID: r.ResponseID, Session: session, ThreadID: r.ThreadID, Turn: r.TurnID, Model: model, At: at, Usage: *r.Usage, Total: r.ThreadUsage, Compaction: true})
 		if change == nil {
 			return nil
 		}
@@ -358,6 +360,19 @@ func codexIntervalKey(v codexContribution) codexInterval {
 	return codexInterval{v.Session, epoch, total.Input, total.Output, v.Usage.Input, v.Usage.Output, true}
 }
 
+func mergeCodexThreadID(old, next codexContribution) (string, bool) {
+	if old.ThreadIDConflict {
+		return "", true
+	}
+	if old.ThreadID == "" {
+		return next.ThreadID, false
+	}
+	if next.ThreadID == "" || next.ThreadID == old.ThreadID {
+		return old.ThreadID, false
+	}
+	return "", true
+}
+
 func (s *codexUsageState) index(i int, v codexContribution) {
 	key := codexIntervalKey(v)
 	if !key.Valid {
@@ -401,25 +416,37 @@ func (s *codexUsageState) record(v codexContribution) *codexChange {
 			s.Conflicts++
 			return nil
 		}
+		threadID, threadIDConflict := mergeCodexThreadID(old, v)
+		identityChanged := threadID != old.ThreadID || threadIDConflict != old.ThreadIDConflict
 		if old.Usage.equal(v.Usage) && old.Usage.Known == v.Usage.Known && old.Model == v.Model && !(old.Total == nil && v.Total != nil) {
-			if !v.Updated.After(old.Updated) {
+			updated := old
+			updated.ThreadID, updated.ThreadIDConflict = threadID, threadIDConflict
+			if !v.Updated.After(old.Updated) && !identityChanged {
 				return nil
 			}
 			// A repeated current snapshot advances revision order, but not the
 			// completion time or counting date. Keep the watermark in the live
 			// index; a changed cold source reconstructs it from the original events.
-			updated := old
-			updated.Updated = v.Updated
+			if v.Updated.After(old.Updated) {
+				updated.Updated = v.Updated
+			}
 			s.Entries[i] = updated
 			return &codexChange{Index: i, Old: &old, Value: updated}
 		}
 		// Event time is the source's revision order. A replay of an older
 		// snapshot cannot undo an accepted update; a tied conflict is ambiguous.
 		if !v.Updated.After(old.Updated) {
+			if identityChanged {
+				updated := old
+				updated.ThreadID, updated.ThreadIDConflict = threadID, threadIDConflict
+				s.Entries[i] = updated
+				return &codexChange{Index: i, Old: &old, Value: updated}
+			}
 			s.Conflicts++
 			return nil
 		}
 		v.At = old.At
+		v.ThreadID, v.ThreadIDConflict = threadID, threadIDConflict
 		s.Entries[i] = v
 		if codexIntervalKey(old) != codexIntervalKey(v) {
 			s.index(i, v)

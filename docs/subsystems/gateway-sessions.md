@@ -348,5 +348,38 @@ writes for a subagent a subagent started (`sessions.SubagentParent`, read once
 a file; a meta file not read is unknown and read again). A gateway row matched
 to a file row keeps the gateway's own. Both were checked against Claude Code
 2.1.296 spawning a subagent from a subagent.
-Codex sub-agents are told apart by `Kind` (`x-openai-subagent`) only: no
-spawned Codex thread was found on disk to take a parent's shape from.
+
+Codex session identity is read from native thread metadata, rather than inferred
+from a shared session header or `Kind` (`x-openai-subagent`). The sessions API
+adds `role` (`main`, `subagent` or `unknown`), and when native metadata
+establishes them, `parent_session` and `root_session`. A child whose root is not
+known keeps an empty `root_session`; Codex entries without explicit identity
+metadata, gateway-only entries and conflicting identities set `role` to
+`unknown` and do not acquire a guessed parent or root. These fields are omitted
+for other agents. This is Codex-specific (#1591).
+
+`GET /api/sessions`, `/api/sessions/one` and `/api/sessions/manage` also return
+`model_effort` for each Codex thread, grouped by the canonical Usage ledger's
+`model` and effective reasoning effort. It carries that thread's input, output,
+cached and cache-write tokens, reasoning tokens, cost, and whether every grouped
+call was priced. The Usage ledger's canonical rows supply these values: a gateway
+response paired to the native `response_id` contributes once with the gateway
+row's `model`, effort, tokens and price, and identical local copies are folded
+once.
+`/api/sessions/overview` adds the same field to its `tokens`, `cost` and `active`
+top summaries using the overview's matching local calendar range; `days=0` uses
+all history. The existing `models` field and session statistics keep their prior
+aggregation and meaning.
+These are fields on the existing API responses; no endpoint or statistics
+structure is added.
+
+In the Usage request APIs, `session_role` classifies the canonical Codex actor as
+`main`, `subagent` or `unknown`. For a confirmed identity, `session` is its root
+thread ID; when the actor is known but its root is not, `session` is empty. An
+unpaired gateway row keeps its raw `session` value and has `session_role`
+`unknown`. The existing `subagent` and `parent_agent` fields are reused for
+Codex: they carry the child thread ID and, when known and itself a subagent, the
+parent thread ID. `native_session` stays the recorded native header. The new
+`session_role` is omitted for other agents, whose existing field semantics stay
+unchanged. Ambiguous or unpaired calls do not inherit a relationship from shared
+session metadata.

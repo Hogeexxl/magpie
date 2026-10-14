@@ -91,19 +91,41 @@ type Model struct {
 	Priced bool    `json:"priced"`
 }
 
+// ModelEffort is one model and reasoning effort's share of a session.
+type ModelEffort struct {
+	Model  string `json:"model"`
+	Effort string `json:"effort"`
+	Tokens
+	Reasoning int     `json:"reasoning"`
+	Cost      float64 `json:"cost"`
+	Priced    bool    `json:"priced"`
+}
+
+// CodexIdentity is a Codex thread's confirmed role and parent chain.
+type CodexIdentity struct {
+	ID            string `json:"id"`
+	Role          string `json:"role"`
+	ParentSession string `json:"parent_session,omitempty"`
+	RootSession   string `json:"root_session,omitempty"`
+}
+
 // Session is one agent session.
 type Session struct {
 	ReadOnly bool `json:"read_only,omitempty"`
 	// Gateway: seen only through magpie's gateway, with no file of the
 	// agent's on this computer (external.go)
-	Gateway bool      `json:"gateway,omitempty"`
-	Agent   string    `json:"agent"` // magpie agent id: claude, codex, opencode, pi, omp, zcode, dsh, cline, qoder, qoder-cn, grok, workbuddy, droid, cursor, hermes, alma, kimi
-	ID      string    `json:"id"`
-	Cwd     string    `json:"cwd"`
-	Title   string    `json:"title"` // the name it was given, else the agent's own title, else the first prompt
-	Start   time.Time `json:"start"`
-	Last    time.Time `json:"last"`
-	Models  []Model   `json:"models"`
+	Gateway       bool          `json:"gateway,omitempty"`
+	Agent         string        `json:"agent"` // magpie agent id: claude, codex, opencode, pi, omp, zcode, dsh, cline, qoder, qoder-cn, grok, workbuddy, droid, cursor, hermes, alma, kimi
+	ID            string        `json:"id"`
+	Cwd           string        `json:"cwd"`
+	Title         string        `json:"title"` // the name it was given, else the agent's own title, else the first prompt
+	Start         time.Time     `json:"start"`
+	Last          time.Time     `json:"last"`
+	Role          string        `json:"role,omitempty"`
+	ParentSession string        `json:"parent_session,omitempty"`
+	RootSession   string        `json:"root_session,omitempty"`
+	ModelEffort   []ModelEffort `json:"model_effort,omitempty"`
+	Models        []Model       `json:"models"`
 	Tokens
 	Cost     float64 `json:"cost"`     // USD at the effective price, for the priced models
 	Unpriced int     `json:"unpriced"` // models that spent tokens but have no known price
@@ -139,24 +161,26 @@ const All = 5000
 
 // state is what one file's parse has come to, enough to read on from Off.
 type state struct {
-	Codex       *codexUsageState  `json:"-"`
-	Claude      *claudeUsageState `json:"-"`
-	DBRevision  string            `json:"db_revision,omitempty"`
-	Head        string            `json:"head,omitempty"`
-	HeadSize    int               `json:"head_size,omitempty"`
-	ContentHash string            `json:"content_hash,omitempty"`
-	Size        int64             `json:"size"`
-	Mod         int64             `json:"mod"` // unix nanoseconds
-	Off         int64             `json:"off"` // after the last whole line read
-	ID          string            `json:"id,omitempty"`
-	Cwd         string            `json:"cwd,omitempty"`
-	Title       string            `json:"title,omitempty"`
-	Named       string            `json:"named,omitempty"`  // the agent's own title for it
-	Custom      string            `json:"custom,omitempty"` // the name the user gave it
-	First       string            `json:"first,omitempty"`  // the first message, when no prompt looked typed
-	Start       time.Time         `json:"start"`
-	Last        time.Time         `json:"last"`
-	Models      map[string]Tokens `json:"models,omitempty"`
+	Codex                 *codexUsageState  `json:"-"`
+	Claude                *claudeUsageState `json:"-"`
+	DBRevision            string            `json:"db_revision,omitempty"`
+	Head                  string            `json:"head,omitempty"`
+	HeadSize              int               `json:"head_size,omitempty"`
+	ContentHash           string            `json:"content_hash,omitempty"`
+	Size                  int64             `json:"size"`
+	Mod                   int64             `json:"mod"` // unix nanoseconds
+	Off                   int64             `json:"off"` // after the last whole line read
+	ID                    string            `json:"id,omitempty"`
+	CodexIdentity         *CodexIdentity    `json:"codex_identity,omitempty"`
+	CodexIdentityConflict bool              `json:"codex_identity_conflict,omitempty"`
+	Cwd                   string            `json:"cwd,omitempty"`
+	Title                 string            `json:"title,omitempty"`
+	Named                 string            `json:"named,omitempty"`  // the agent's own title for it
+	Custom                string            `json:"custom,omitempty"` // the name the user gave it
+	First                 string            `json:"first,omitempty"`  // the first message, when no prompt looked typed
+	Start                 time.Time         `json:"start"`
+	Last                  time.Time         `json:"last"`
+	Models                map[string]Tokens `json:"models,omitempty"`
 	// Days is Models again, split by the local date each message was
 	// written on: a session that runs past midnight counts on both days.
 	Days map[string]*day `json:"days,omitempty"`
@@ -555,7 +579,8 @@ func CachePath() string { return filepath.Join(filepath.Dir(catalog.CachePath())
 // 17: reconcile recent Claude message revisions.
 // 18: Claude Code's 1-hour cache writes apart from its 5-minute ones.
 // 19: the names the user gave Claude Code's and WorkBuddy's (custom-title).
-const cacheVersion = 19
+// 20: Codex's source and direct parent thread identity.
+const cacheVersion = 20
 
 type cacheFile struct {
 	Version int               `json:"version"`
@@ -675,7 +700,8 @@ func writeCache(c *save) {
 
 // refresh parses those of want that changed since their parse was kept, a
 // few files at a time, and keeps the parses of every file still on disk
-// (all of them), read by List or by Stats.
+// (all of them), read by List or by Stats. With no all-set it leaves other
+// cached agents alone, for a Codex-only identity refresh.
 func refresh(want, all []file) {
 	defer func() { trimSummaryRevisions(time.Now()) }()
 	var todo []file
@@ -688,7 +714,7 @@ func refresh(want, all []file) {
 		}
 	}
 	gone := false
-	if len(cache) > 0 {
+	if len(cache) > 0 && all != nil {
 		on := make(map[string]bool, len(all))
 		for _, f := range all {
 			on[f.path] = true
@@ -949,11 +975,13 @@ func List(limit int) []Session {
 	// indexes them all in one run the page can show, and the stats read
 	// after it has nothing left to do
 	refresh(files, files)
+	identities := codexIdentitySnapshot(files)
 
 	price := pricer()
 	out := []Session{}
 	for _, k := range keys {
 		if s, ok := assemble(groups[k], price); ok {
+			setSessionCodexIdentity(&s, identities)
 			out = append(out, s)
 			if len(out) == limit {
 				break
@@ -1518,6 +1546,20 @@ func Get(key string) (Session, bool) {
 	if len(fs) == 0 {
 		return Session{}, false
 	}
-	refresh(fs, files)
-	return assemble(fs, pricer())
+	var identities map[string]CodexIdentity
+	if strings.HasPrefix(key, "codex:") {
+		var codexFiles []file
+		for _, f := range files {
+			if f.agent == "codex" {
+				codexFiles = append(codexFiles, f)
+			}
+		}
+		refresh(codexFiles, files)
+		identities = codexIdentitySnapshot(codexFiles)
+	} else {
+		refresh(fs, files)
+	}
+	s, ok := assemble(fs, pricer())
+	setSessionCodexIdentity(&s, identities)
+	return s, ok
 }

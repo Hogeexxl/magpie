@@ -117,10 +117,15 @@ func ListAgent(agent string) []Managed {
 		}
 	}
 	refresh(mine, all)
+	identities := map[string]CodexIdentity(nil)
+	if agent == "codex" {
+		identities = codexIdentitySnapshot(mine)
+	}
 	price := pricer()
 	out := []Managed{}
 	for _, fs := range groups {
 		s, _ := assemble(fs, price)
+		setSessionCodexIdentity(&s, identities)
 		if s.Resume == "" && !s.ReadOnly {
 			s.Resume = resumeCommand(s.WSL, s.Agent, s.ID, s.Cwd, s.Path)
 		}

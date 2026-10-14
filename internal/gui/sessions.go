@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,6 +102,16 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 		if len(list) > n {
 			list = list[:n]
 		}
+		var modelEffort map[string][]sessions.ModelEffort
+		for _, s := range list {
+			if s.Agent == "codex" {
+				modelEffort = usage.CodexModelEffort(usage.All)
+				break
+			}
+		}
+		for i := range list {
+			addCodexModelEffort(&list[i], modelEffort)
+		}
 		since := time.Now()
 		for _, s := range list {
 			if !s.Start.IsZero() && s.Start.Before(since) {
@@ -149,7 +160,33 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 	mux.HandleFunc("GET /api/sessions/overview", func(rw http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		n, _ := strconv.Atoi(q.Get("days"))
-		writeJSON(rw, statsFor(n).Overview(q.Get("agent"), q.Get("model"), q.Get("cwd"), 8))
+		st := statsFor(n)
+		out := st.Overview(q.Get("agent"), q.Get("model"), q.Get("cwd"), 8)
+		period := usage.All
+		if n > 0 {
+			if p, ok := usage.RangeOf(st.From, st.To); ok {
+				period = p
+			}
+		}
+		needCodex := false
+		for key, top := range out.Top {
+			out.Top[key] = slices.Clone(top)
+			for i := range out.Top[key] {
+				if out.Top[key][i].Agent == "codex" {
+					needCodex = true
+				}
+			}
+		}
+		if needCodex {
+			modelEffort := usage.CodexModelEffort(period)
+			for key, top := range out.Top {
+				for i := range top {
+					addCodexSummaryModelEffort(&top[i], modelEffort)
+				}
+				out.Top[key] = top
+			}
+		}
+		writeJSON(rw, out)
 	})
 	// progress is how far the reading of the session files has got, for
 	// the page to show while its first read takes a while.
@@ -174,6 +211,9 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			rw.WriteHeader(http.StatusNotFound)
 			_ = json.NewEncoder(rw).Encode(map[string]string{"error": "no such session"})
 			return
+		}
+		if s.Agent == "codex" {
+			addCodexModelEffort(&s, usage.CodexModelEffort(usage.All))
 		}
 		j := sessionJSON{Session: s, Name: s.Agent, Icon: "generic"}
 		for _, a := range agent.Clients() {
